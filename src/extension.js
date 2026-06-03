@@ -182,6 +182,7 @@ class Manager {
         this._tapHold = 0;
         this._tapHoldWin = null;
         this._tapHoldTick = 0;
+        this._gestureBeginTick = 0;
 
         // Pinch
         this._gesture = {
@@ -633,6 +634,144 @@ class Manager {
         // App.create_icon_texture;
     }
 
+    _windowAllowsMove(win) {
+        try {
+            if (typeof win?.allows_move === 'function') {
+                return win.allows_move();
+            }
+        }
+        catch (_) { }
+        return true;
+    }
+
+    _windowCanMaximize(win) {
+        try {
+            if (typeof win?.can_maximize === 'function') {
+                if (win.can_maximize()) {
+                    return true;
+                }
+                // GNOME 50 compatibility: fallback to maximize method
+                // when can_maximize() reports false unexpectedly.
+                return (typeof win?.maximize === 'function');
+            }
+        }
+        catch (_) { }
+        return true;
+    }
+
+    _windowIsTiled(win) {
+        try {
+            if (typeof win?.is_tiled === 'function') {
+                return win.is_tiled();
+            }
+            if (Object.prototype.hasOwnProperty.call(win ?? {}, 'isTiled')) {
+                return !!win.isTiled;
+            }
+        }
+        catch (_) { }
+        return false;
+    }
+
+    _windowIsMaximized(win) {
+        try {
+            if (typeof win?.is_maximized === 'function') {
+                return !!win.is_maximized();
+            }
+        }
+        catch (_) { }
+        try {
+            if (typeof win?.get_maximize_flags === 'function') {
+                let flags = win.get_maximize_flags();
+                if (typeof flags === 'number') {
+                    return (flags & Meta.MaximizeFlags.BOTH) ===
+                        Meta.MaximizeFlags.BOTH;
+                }
+            }
+        }
+        catch (_) { }
+        try {
+            let state = win?.get_maximized?.();
+            if (state === true) {
+                return true;
+            }
+            if (typeof state === 'number') {
+                return (state & Meta.MaximizeFlags.BOTH) ===
+                    Meta.MaximizeFlags.BOTH;
+            }
+        }
+        catch (_) { }
+        return false;
+    }
+
+    _windowMaximize(win) {
+        try {
+            win?.maximize?.(Meta.MaximizeFlags.BOTH);
+            return true;
+        }
+        catch (_) { }
+        return false;
+    }
+
+    _windowRestore(win) {
+        try {
+            win?.unmaximize?.(Meta.MaximizeFlags.BOTH);
+            return true;
+        }
+        catch (_) { }
+        return false;
+    }
+
+    _windowCanMinimize(win) {
+        try {
+            if (typeof win?.can_minimize === 'function') {
+                return win.can_minimize();
+            }
+        }
+        catch (_) { }
+        return true;
+    }
+
+    _windowMinimize(win) {
+        try {
+            win?.minimize?.();
+            return true;
+        }
+        catch (_) { }
+        return false;
+    }
+
+    _windowActionThreshold(win, ui) {
+        // Quicker window-state swipes on GNOME 50:
+        // require only 80% gesture progress (20% shorter distance).
+        // For swipe-up maximize from normal windows, use a much lower threshold
+        // so quick upward flicks are reliably recognized.
+        if (ui == 1) {
+            return 0.25;
+        }
+        if (ui >= 2 && ui <= 7) {
+            return 0.8;
+        }
+        return 1.0;
+    }
+
+    _windowMakeFullscreen(win) {
+        try {
+            win?.make_fullscreen?.();
+            return true;
+        }
+        catch (_) { }
+        return false;
+    }
+
+    _windowUnmakeFullscreen(win) {
+        try {
+            win?.unmake_fullscreen?.();
+            return true;
+        }
+        catch (_) { }
+        return false;
+    }
+
     // Snap Window
     _setSnapWindow(snapRight) {
         if (this._targetWindow == null) {
@@ -741,7 +880,7 @@ class Manager {
         this._activateWindow();
 
         // gnome-shell-extension-tiling-assistant support
-        if (this._targetWindow.isTiled) {
+        if (this._windowIsTiled(this._targetWindow)) {
             let urct = this._targetWindow.untiledRect;
             if (urct) {
                 let r = urct._rect;
@@ -891,6 +1030,7 @@ class Manager {
         // Velocity Variables
         this._gesture.velocity = this._velocityInit();
         this._velocityAppend(this._gesture.velocity, 0);
+        this._gestureBeginTick = this._tick();
 
         // Get current mouse position
         let [pointerX, pointerY, pointerZ] = global.get_pointer();
@@ -975,8 +1115,8 @@ class Manager {
         // Check allow resize
         if (this._swipeIsWin && !this._isActiveWin && allowResize &&
             this._targetWindow.allows_resize() &&
-            this._targetWindow.allows_move() &&
-            !this._targetWindow.isTiled && !isTapHoldAction) {
+            this._windowAllowsMove(this._targetWindow) &&
+            !this._windowIsTiled(this._targetWindow) && !isTapHoldAction) {
             // Edge cursor position detection
             if (this._startPos.y >= wBottom - edge) {
                 if (this._startPos.y <= wBottom) {
@@ -1037,9 +1177,18 @@ class Manager {
                 setmove = true;
             }
             if (setmove) {
-                if (this._targetWindow.allows_move() &&
-                    !this._targetWindow.get_maximized()) {
-                    this._edgeAction = WindowEdgeAction.MOVE;
+                if (this._windowAllowsMove(this._targetWindow) &&
+                    !this._windowIsMaximized(this._targetWindow)) {
+                    if (this._getTapHoldMove() &&
+                        this._tapHold == this._gestureNumFinger()) {
+                        // Tap-hold always starts direct move
+                        this._edgeAction = WindowEdgeAction.MOVE;
+                    }
+                    else {
+                        // For top-edge swipe, decide intent on first direction:
+                        // quick vertical swipe => gesture action, slower => drag
+                        this._edgeAction = WindowEdgeAction.WAIT_GESTURE;
+                    }
                 }
             }
         } else if (this._tapHold > 2 &&
@@ -1074,55 +1223,104 @@ class Manager {
         let combineTrigger = this._gestureThreshold() * 2;
         let trigger = (threshold / 4) + 1;
         let target = 1.00 * (trigger + (threshold * 10));
+        if (this._swipeIsWin) {
+            // Make 3-finger window-state gestures easier to reach.
+            target *= 0.75;
+        }
+        if (this._swipeIsWin && this._targetWindow &&
+            (this._windowIsMaximized(this._targetWindow) ||
+                this._targetWindow.is_fullscreen())) {
+            // Reduce required swipe distance by 20% for max/fullscreen windows
+            target *= 0.8;
+        }
         let absX = Math.abs(this._movePos.x);
         let absY = Math.abs(this._movePos.y);
 
         // Find gesture directions
-        if (this._edgeAction == WindowEdgeAction.NONE) {
+        if (this._edgeAction == WindowEdgeAction.NONE ||
+            this._edgeAction == WindowEdgeAction.WAIT_GESTURE) {
             if (absX >= trigger || absY >= trigger) {
-                if (absX > absY) {
-                    if (this._movePos.x <= 0 - trigger) {
-                        this._edgeAction = WindowEdgeAction.GESTURE_LEFT;
+                let waitGesture =
+                    (this._edgeAction == WindowEdgeAction.WAIT_GESTURE);
+                if (waitGesture) {
+                    let elapsed = this._tick() - this._gestureBeginTick;
+                    let quickSwipe = (elapsed <= 220);
+                    let dragTrigger = threshold * 1.35;
+                    if (absX > absY) {
+                        if (this._movePos.x <= 0 - trigger) {
+                            this._edgeAction = WindowEdgeAction.GESTURE_LEFT;
+                        }
+                        else if (this._movePos.x >= trigger) {
+                            this._edgeAction = WindowEdgeAction.GESTURE_RIGHT;
+                        }
+                        this._movePos.y = 0;
                     }
-                    else if (this._movePos.x >= trigger) {
-                        this._edgeAction = WindowEdgeAction.GESTURE_RIGHT;
-                    }
-                    this._movePos.y = 0;
-                }
-                else {
-                    if (this._movePos.y <= 0 - trigger) {
-                        this._edgeAction = WindowEdgeAction.GESTURE_UP;
-                    }
-                    else if (this._movePos.y >= trigger) {
-                        this._edgeAction = WindowEdgeAction.GESTURE_DOWN;
-                        if (this._swipeIsWin) {
-                            let allowMove = this._getEnableMove();
-                            let holdMove = this._getTapHoldMove();
-
-                            if (!allowMove || holdMove) {
-                                if (!this._targetWindow.get_maximized() &&
-                                    !this._targetWindow.isTiled) {
-                                    this._edgeGestured = 1;
-                                }
-                                else {
-                                    this._edgeGestured = 0;
-                                }
-                            }
-                            else if (
-                                !this._edgeGestured &&
+                    else {
+                        if (this._movePos.y <= 0 - trigger) {
+                            this._edgeAction = WindowEdgeAction.GESTURE_UP;
+                        }
+                        else if (this._movePos.y >= trigger) {
+                            let canMoveWindow =
                                 !this._targetWindow.is_fullscreen() &&
-                                !this._targetWindow.get_maximized() &&
-                                this._targetWindow.allows_move()) {
+                                !this._windowIsMaximized(this._targetWindow) &&
+                                this._windowAllowsMove(this._targetWindow);
+                            if (!quickSwipe && absY >= dragTrigger && canMoveWindow) {
                                 this._edgeAction = WindowEdgeAction.MOVE;
                                 return this._swipeUpdateMove();
                             }
+                            this._edgeAction = WindowEdgeAction.GESTURE_DOWN;
+                            this._edgeGestured = 1;
                         }
+                        this._movePos.x = 0;
                     }
-                    this._movePos.x = 0;
+                    this._gesture.velocity = this._velocityInit();
+                    this._velocityAppend(this._gesture.velocity, 0);
                 }
-                this._edgeGestured = this._edgeGestured ? 2 : 1;
-                this._gesture.velocity = this._velocityInit();
-                this._velocityAppend(this._gesture.velocity, 0);
+                else {
+                    if (absX > absY) {
+                        if (this._movePos.x <= 0 - trigger) {
+                            this._edgeAction = WindowEdgeAction.GESTURE_LEFT;
+                        }
+                        else if (this._movePos.x >= trigger) {
+                            this._edgeAction = WindowEdgeAction.GESTURE_RIGHT;
+                        }
+                        this._movePos.y = 0;
+                    }
+                    else {
+                        if (this._movePos.y <= 0 - trigger) {
+                            this._edgeAction = WindowEdgeAction.GESTURE_UP;
+                        }
+                        else if (this._movePos.y >= trigger) {
+                            this._edgeAction = WindowEdgeAction.GESTURE_DOWN;
+                            if (this._swipeIsWin) {
+                                let allowMove = this._getEnableMove();
+                                let holdMove = this._getTapHoldMove();
+
+                                if (!allowMove || holdMove) {
+                                    if (!this._windowIsMaximized(this._targetWindow) &&
+                                        !this._windowIsTiled(this._targetWindow)) {
+                                        this._edgeGestured = 1;
+                                    }
+                                    else {
+                                        this._edgeGestured = 0;
+                                    }
+                                }
+                                else if (
+                                    !this._edgeGestured &&
+                                    !this._targetWindow.is_fullscreen() &&
+                                    !this._windowIsMaximized(this._targetWindow) &&
+                                    this._windowAllowsMove(this._targetWindow)) {
+                                    this._edgeAction = WindowEdgeAction.MOVE;
+                                    return this._swipeUpdateMove();
+                                }
+                            }
+                        }
+                        this._movePos.x = 0;
+                    }
+                    this._edgeGestured = this._edgeGestured ? 2 : 1;
+                    this._gesture.velocity = this._velocityInit();
+                    this._velocityAppend(this._gesture.velocity, 0);
+                }
             }
         }
 
@@ -1328,9 +1526,9 @@ class Manager {
         if (this._isEdge(WindowEdgeAction.MOVE)) {
             this._hidePreview();
             if (this._isEdge(WindowEdgeAction.MOVE_SNAP_TOP)) {
-                if (this._targetWindow.can_maximize()) {
+                if (this._windowCanMaximize(this._targetWindow)) {
                     this._resetWinPos();
-                    this._targetWindow.maximize(Meta.MaximizeFlags.BOTH);
+                    this._windowMaximize(this._targetWindow);
                 }
             }
             else if (this._isEdge(WindowEdgeAction.MOVE_SNAP_LEFT)) {
@@ -1353,8 +1551,81 @@ class Manager {
         if (this._gesture.action) {
             let aid = this._actionIdGet(this._gesture.action);
             if (aid) {
+                if (aid == 50) {
+                    let activeWin = global.display.get_focus_window();
+                    if (activeWin &&
+                        !this._windowIsMaximized(activeWin) &&
+                        !activeWin?.is_fullscreen?.()) {
+                        // Hard fallback for GNOME 50:
+                        // non-maximized swipe-up should always maximize.
+                        if (this._gesture.progress >= 0.15) {
+                            this._sendKeyPress([
+                                Clutter.KEY_Super_L, Clutter.KEY_Up
+                            ]);
+                        }
+                        else {
+                            this._runAction(aid, 1, 0);
+                        }
+                        this._clearVars();
+                        return retval;
+                    }
+                }
+                if (aid >= 50) {
+                    let activeWin = global.display.get_focus_window();
+                    if (!activeWin) {
+                        this._runAction(aid, 1, 0);
+                        this._clearVars();
+                        return retval;
+                    }
+                    let winCanMax = this._windowCanMaximize(activeWin);
+                    let winIsMaximized = this._windowIsMaximized(activeWin);
+                    if (this._windowIsTiled(activeWin)) {
+                        winIsMaximized = true;
+                    }
+                    let winIsFullscreen = activeWin?.is_fullscreen?.();
+                    let allowFullscreen = this._getEnableFullscreen();
+                    let ui = 0;
+                    if (aid < 53) {
+                        if (aid == 50 && !winIsMaximized && !winIsFullscreen) {
+                            // Force swipe-up on normal windows to maximize path.
+                            ui = 1;
+                        }
+                        else
+                        if (winIsMaximized) {
+                            if (winIsFullscreen) {
+                                ui = 5;
+                            }
+                            else if (allowFullscreen) {
+                                ui = 4;
+                            }
+                            else {
+                                ui = 6;
+                            }
+                        }
+                        else if (winCanMax) {
+                            ui = aid - 49;
+                        }
+                    }
+                    else if (winIsFullscreen) {
+                        ui = 5;
+                    }
+                    else if (winIsMaximized) {
+                        ui = 6;
+                    }
+                    else if (this._windowCanMinimize(activeWin)) {
+                        ui = 7;
+                    }
+                    let minProgress = this._windowActionThreshold(activeWin, ui);
+                    if (this._gesture.progress < minProgress) {
+                        // For window-state gestures, short release must cancel.
+                        this._runAction(aid, 1, 0);
+                        this._clearVars();
+                        return retval;
+                    }
+                }
                 let issnapaction = (aid == 51 || aid == 52);
-                if ((this._gesture.progress < 1.0) && !issnapaction) {
+                if ((this._gesture.progress < 1.0) &&
+                    !issnapaction && aid < 50) {
                     // Fling Velocity
                     let vel = this._velocityCalc(this._gesture.velocity);
                     if (vel > 0.001) {
@@ -1549,8 +1820,8 @@ class Manager {
                     if (!activeWin) {
                         activeWin = global.display.get_focus_window();
                     }
-                    if (activeWin && ((activeWin.allows_move() &&
-                        !activeWin.get_maximized()) || !isWin)) {
+                    if (activeWin && ((this._windowAllowsMove(activeWin) &&
+                        !this._windowIsMaximized(activeWin)) || !isWin)) {
                         activeWin.activate(
                             Meta.CURRENT_TIME
                         );
@@ -2501,10 +2772,10 @@ class Manager {
                 return; // Ignore blacklisted
             }
 
-            let winCanMax = activeWin.allows_move() && activeWin.can_maximize();
-            let winIsMaximized = activeWin.get_maximized();
-            let winMaxed = Meta.MaximizeFlags.BOTH == winIsMaximized;
-            if (activeWin.isTiled) {
+            let winCanMax = this._windowCanMaximize(activeWin);
+            let winIsMaximized = this._windowIsMaximized(activeWin);
+            let winMaxed = this._windowIsMaximized(activeWin);
+            if (this._windowIsTiled(activeWin)) {
                 winIsMaximized = Meta.MaximizeFlags.VERTICAL;
             }
             let winIsFullscreen = activeWin.is_fullscreen();
@@ -2512,7 +2783,11 @@ class Manager {
             let ui = 0; // find action id
             if (id < 53) {
                 // Maximize
-                if (winMaxed) {
+                if (id == 50 && !winMaxed && !winIsFullscreen) {
+                    // Force swipe-up on normal windows to maximize path.
+                    ui = 1;
+                }
+                else if (winMaxed) {
                     if (winIsFullscreen) {
                         ui = 5; // un-fullscreen
                     }
@@ -2534,29 +2809,33 @@ class Manager {
             else if (winIsMaximized) {
                 ui = 6; // restore
             }
+            else if (this._windowCanMinimize(activeWin)) {
+                ui = 7; // minimize
+            }
             let wid = "wmax_state" + ui;
 
             if (ui) {
                 if (!state) {
                     if (ui == 4) {
                         // fullsccreen
-                        activeWin?.get_compositor_private()
-                            .set_pivot_point(0.5, 1);
-                        activeWin.get_compositor_private().scale_y =
-                            1.0 + (progress * 0.025);
+                        let actor = activeWin?.get_compositor_private?.();
+                        actor?.set_pivot_point(0.5, 1);
+                        if (actor) {
+                            actor.scale_y = 1.0 + (progress * 0.025);
+                        }
                     }
                     else if (ui >= 5) {
                         // un-fullsccreen / restore
-                        activeWin?.get_compositor_private()
-                            .set_pivot_point(0.5, 1);
-                        if (ui == 6) {
-                            activeWin.get_compositor_private().scale_y =
-                                activeWin.get_compositor_private().scale_x =
-                                1.0 - (progress * 0.04);
-                        }
-                        else {
-                            activeWin.get_compositor_private().scale_y =
-                                1.0 - (progress * 0.025);
+                        let actor = activeWin?.get_compositor_private?.();
+                        actor?.set_pivot_point(0.5, 1);
+                        if (actor) {
+                            if (ui == 6 || ui == 7) {
+                                actor.scale_y = actor.scale_x =
+                                    1.0 - (progress * 0.04);
+                            }
+                            else {
+                                actor.scale_y = 1.0 - (progress * 0.025);
+                            }
                         }
                     }
                     else if (ui <= 3) {
@@ -2606,9 +2885,15 @@ class Manager {
                             clearTimeout(this._actionWidgets.tilerHider);
                             this._actionWidgets.tilerHider = null;
                         }
-                        if (this._actionWidgets[wid] && (progress > 0)) {
+                        if (this._actionWidgets[wid] &&
+                            (progress >= this._windowActionThreshold(activeWin, ui))) {
                             if (ui == 1) {
-                                activeWin.maximize(Meta.MaximizeFlags.BOTH);
+                                // GNOME 50: keyboard maximize is more reliable
+                                // than direct Meta call across window types.
+                                this._sendKeyPress([
+                                    Clutter.KEY_Super_L, Clutter.KEY_Up
+                                ]);
+                                this._windowMaximize(activeWin);
                             }
                             else if (ui == 2) {
                                 this._setSnapWindow(0);
@@ -2626,35 +2911,45 @@ class Manager {
                     }
                     else {
                         // resize back
-                        activeWin?.get_compositor_private().ease({
+                        let actor = activeWin?.get_compositor_private?.();
+                        actor?.ease({
                             duration: Math.round(200 * progress),
                             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                             scale_y: 1,
                             scale_x: 1,
                             onStopped: () => {
-                                activeWin?.get_compositor_private()
-                                    .set_pivot_point(0, 0);
+                                actor?.set_pivot_point(0, 0);
                             }
                         });
-                        if (progress >= 0.5) {
+                        if (progress >= this._windowActionThreshold(activeWin, ui)) {
                             if (ui == 4) {
                                 // fullscreen
-                                activeWin.make_fullscreen();
+                                if (!this._windowMakeFullscreen(activeWin)) {
+                                    this._sendKeyPress([Clutter.KEY_F11]);
+                                }
                             }
                             else if (ui == 5) {
                                 // un-fullscreen
-                                activeWin.unmake_fullscreen();
+                                if (!this._windowUnmakeFullscreen(activeWin)) {
+                                    this._sendKeyPress([Clutter.KEY_F11]);
+                                }
                             }
                             else if (ui == 6) {
                                 // restore
-                                activeWin.unmaximize(
-                                    Meta.MaximizeFlags.BOTH
-                                );
-                                if (activeWin.isTiled) {
+                                if (!this._windowRestore(activeWin)) {
                                     this._sendKeyPress([
                                         Clutter.KEY_Super_L, Clutter.KEY_Down
                                     ]);
                                 }
+                                if (this._windowIsTiled(activeWin)) {
+                                    this._sendKeyPress([
+                                        Clutter.KEY_Super_L, Clutter.KEY_Down
+                                    ]);
+                                }
+                            }
+                            else if (ui == 7) {
+                                // minimize
+                                this._windowMinimize(activeWin);
                             }
                         }
                     }
